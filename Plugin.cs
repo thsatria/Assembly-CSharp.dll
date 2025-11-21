@@ -1,29 +1,27 @@
-// Plugin_Final.cs - PART 1/4
-// Integrates Marker List, Auto-Teleport on placement, Hotkey, Filters.
-// UI: OnGUI / GUILayout (keputusan: A)
 
 using BepInEx;
 using BepInEx.Logging;
 using HarmonyLib;
 using System;
 using System.Reflection;
+using System.Collections;
 using System.Collections.Generic;
-using System.Linq;
 using UnityEngine;
-using UnityEngine.UI;
 
-// Keep namespace-free to match existing plugin style
-[BepInPlugin("com.user.dinkum.cheatmenu.final", "Dinkum Cheat Menu - Final", "1.0.5")]
+[BepInPlugin("com.user.dinkum.cheatmenu.modern", "Dinkum Cheat Menu - Modern", "1.0.4")]
 public class DinkumCheatMenu : BaseUnityPlugin
 {
     internal static DinkumCheatMenu Instance;
     internal static ManualLogSource Log;
 
-    private Rect windowRect = new Rect(60, 60, 640, 640);
+    private Rect windowRect = new Rect(60, 60, 560, 560);
     private bool uiOpen = false;
     private int tabIndex = 0;
     private Vector2 scrollPos = Vector2.zero;
 
+    // Teleport
+    private Vector3 savedPos = Vector3.zero;
+	
     // Player options
     private bool godMode = false;
     private bool infiniteStamina = false;
@@ -48,7 +46,7 @@ public class DinkumCheatMenu : BaseUnityPlugin
     private string[] categoryNames = Enum.GetNames(typeof(ItemCategory));
     private int categoryDropdownIndex = 0;
 
-    // Reflection cache (inventory/status)
+    // Reflection cache
     private Type inventoryType = null;
     private object inventoryInstance = null;
     private FieldInfo walletField = null;
@@ -62,41 +60,18 @@ public class DinkumCheatMenu : BaseUnityPlugin
     private MethodInfo getStaminaMaxMethod = null;
     private FieldInfo staminaField = null;
 
-    // Marker/Map helpers
-    private List<mapIcon> markerList = new List<mapIcon>();
-    private int selectedMarkerIndex = -1;
-    private Vector2 markerScroll = Vector2.zero;
-    private double lastMarkerScanTime = 0.0;
-    private float markerScanInterval = 0.5f; // seconds
-    private HashSet<int> knownMarkerInstanceIds = new HashSet<int>();
+    // Exposed property
+    public static bool IsGodMode => Instance?.godMode ?? false;
 
-    // Auto-teleport when player places a marker
-    private bool autoTeleportOnPlace = false;
-    private bool autoTeleportOnlyLocal = true; // only teleport to markers when we detect they're new (no reliable placedBy check in all cases)
-
-    // Hotkey
-    private KeyCode hotkeyTeleport = KeyCode.F6; // default hotkey
-
-    // Filters enum
-    private enum MarkerFilter { All, PlayerPlaced, Quest, NPC, TeleTower, TileObject, Special }
-    private MarkerFilter currentFilter = MarkerFilter.All;
-
-    // Teleport safety
-    private float teleportYOffset = 1.3f;
-
-    // Teleport saved pos (existing)
-    Vector3 savedPos = Vector3.zero;
-
-    // ============================ Awake + Harmony ============================
     void Awake()
     {
         Instance = this;
         Log = Logger;
-        Log.LogInfo("Dinkum Cheat Menu Final loaded — marker features enabled.");
+        Log.LogInfo("Dinkum Cheat Menu loaded — durability removed, tools/world moved to Player tab.");
 
         try
         {
-            var harmony = new Harmony("com.user.dinkum.cheatmenu.final.patch");
+            var harmony = new Harmony("com.user.dinkum.cheatmenu.patch");
             var dmgType = AccessTools.TypeByName("Damageable");
             if (dmgType != null)
             {
@@ -118,27 +93,14 @@ public class DinkumCheatMenu : BaseUnityPlugin
         {
             Log.LogError("Harmony patching failed: " + ex.Message);
         }
-
-        // seed known markers on start
-        RefreshMarkers(true);
     }
 
-    static bool Prefix_ChangeHealth(object __instance, int dif) => Instance?.godMode == true && dif < 0 ? false : true;
-    static bool Prefix_DoT(object __instance, int damageToDeal) => Instance?.godMode == true ? false : true;
-    static bool Prefix_SetOnFire(object __instance) => Instance?.godMode == true ? false : true;
+    static bool Prefix_ChangeHealth(object __instance, int dif) => IsGodMode && dif < 0 ? false : true;
+    static bool Prefix_DoT(object __instance, int damageToDeal) => IsGodMode ? false : true;
+    static bool Prefix_SetOnFire(object __instance) => IsGodMode ? false : true;
 
-    // ============================ Update ============================
     void Update()
     {
-		if (firstRun)
-		{
-			LoadReflection();
-			firstRun = false;
-		}
-
-		CheckAutoTeleportNewMarker();
-		ApplyTimeFreeze();
-		
         if (Input.GetKeyDown(KeyCode.F5))
         {
             uiOpen = !uiOpen;
@@ -146,29 +108,19 @@ public class DinkumCheatMenu : BaseUnityPlugin
             Cursor.lockState = uiOpen ? CursorLockMode.None : CursorLockMode.Locked;
         }
 
-        // Hotkey: teleport to selected or last marker
-        if (Input.GetKeyDown(hotkeyTeleport))
-        {
-            TryTeleportHotkey();
-        }
-
         if (infiniteStamina) TrySetStaminaToMax();
-
-        // Periodically scan markers
-        if (DateTime.UtcNow.Subtract(new DateTime(1970,1,1)).TotalSeconds - lastMarkerScanTime > markerScanInterval)
-        {
-            lastMarkerScanTime = (float)DateTime.UtcNow.Subtract(new DateTime(1970,1,1)).TotalSeconds;
-            RefreshMarkers(false);
-        }
-
-        // Auto-teleport if enabled — detect newly added player-placed markers
-        if (autoTeleportOnPlace)
-        {
-            CheckAutoTeleportNewMarker();
-        }
+		
+		if (Input.GetKeyDown(KeyCode.T))
+		{
+			TeleportToLastPlayerMarker();
+		}
+		
+		if (Input.GetKey(KeyCode.LeftShift) && Input.GetKeyDown(KeyCode.T))
+		{
+			TeleportToPlayerHouse();
+		}
     }
 
-    // ============================ GUI ============================
     void OnGUI()
     {
         if (!uiOpen) return;
@@ -179,7 +131,7 @@ public class DinkumCheatMenu : BaseUnityPlugin
     {
         GUILayout.BeginVertical();
 
-        // Top tabs: Player | Items | Teleport (World & Tools removed; marker features in Teleport)
+        // Top tabs: Player | Items | Teleport (World & Tools removed; moved to Player)
         GUILayout.BeginHorizontal();
         if (GUILayout.Button("Player", GUILayout.Height(30))) tabIndex = 0;
         if (GUILayout.Button("Items", GUILayout.Height(30))) tabIndex = 1;
@@ -188,7 +140,7 @@ public class DinkumCheatMenu : BaseUnityPlugin
 
         GUILayout.Space(8);
 
-        scrollPos = GUILayout.BeginScrollView(scrollPos, GUILayout.Width(600), GUILayout.Height(520));
+        scrollPos = GUILayout.BeginScrollView(scrollPos, GUILayout.Width(540), GUILayout.Height(440));
 
         switch (tabIndex)
         {
@@ -200,110 +152,153 @@ public class DinkumCheatMenu : BaseUnityPlugin
         GUILayout.EndScrollView();
 
         GUILayout.BeginHorizontal();
-        if (GUILayout.Button("Close", GUILayout.Width(140)))
+        if (GUILayout.Button("Close", GUILayout.Width(120)))
         {
             uiOpen = false;
             Cursor.visible = false;
             Cursor.lockState = CursorLockMode.Locked;
         }
-        if (GUILayout.Button("Reload Items", GUILayout.Width(140))) LoadItems();
+        if (GUILayout.Button("Reload Items", GUILayout.Width(120))) LoadItems();
         GUILayout.EndHorizontal();
 
         GUILayout.EndVertical();
         GUI.DragWindow(new Rect(0, 0, 10000, 20));
+		
     }
 
-    // ---------------- end of PART 1/4 (continue next part)
-	// Plugin_Final.cs — PART 2/4
-	// (Sambungan dari PART 1/4)
+    // PLAYER TAB (includes previous Tools & World features)
+    void DrawPlayerTab()
+    {
+        GUILayout.Label("Player Cheats", GUI.skin.box);
 
+        godMode = GUILayout.Toggle(godMode, "God Mode");
+        infiniteStamina = GUILayout.Toggle(infiniteStamina, "Infinite Stamina");
 
-	// ============================ PLAYER TAB ============================
-	void DrawPlayerTab()
+        GUILayout.Space(8);
+
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("Add Money:", GUILayout.Width(150));
+        addMoneyAmount = IntField(addMoneyAmount, 120);
+        if (GUILayout.Button($"Add {addMoneyAmount:N0}", GUILayout.Width(160)))
+            AddMoney(addMoneyAmount);
+        GUILayout.EndHorizontal();
+
+        GUILayout.Space(8);
+
+        // Freeze Time moved here
+        GUILayout.BeginHorizontal();
+        freezeTime = GUILayout.Toggle(freezeTime, "Freeze Time");
+        if (GUILayout.Button("Toggle Freeze Time", GUILayout.Width(160)))
+            ToggleFreezeTime();
+        GUILayout.EndHorizontal();
+
+        GUILayout.Space(8);
+
+        // Licenses & Give Tools moved here
+        GUILayout.BeginHorizontal();
+        if (GUILayout.Button("Unlock All Licenses", GUILayout.Width(200)))
+            UnlockAllLicences();
+        if (GUILayout.Button("Give Common Tools", GUILayout.Width(200)))
+            GiveAllTools();
+        GUILayout.EndHorizontal();
+    }
+
+    // ITEMS TAB
+    void DrawItemsTab()
+    {
+        GUILayout.Label("Item Spawner", GUI.skin.box);
+
+        if (!itemsLoaded)
+        {
+            if (GUILayout.Button("Load Items"))
+                LoadItems();
+            GUILayout.Label("(Requires Inventory.Instance.allItems)");
+            return;
+        }
+
+        if (itemNames.Length > 0)
+        {
+            int idx = Mathf.Clamp(selectedItemIndex, 0, itemNames.Length - 1);
+            GUILayout.BeginHorizontal();
+            GUILayout.Label($"Quick Spawn: {itemNames[idx]} (ID: {itemIds[idx]})", GUILayout.Width(340));
+            spawnAmount = IntField(spawnAmount, 80);
+            if (GUILayout.Button("Spawn", GUILayout.Width(80)))
+                SpawnItemById(itemIds[idx], spawnAmount);
+            GUILayout.EndHorizontal();
+            GUILayout.Space(6);
+        }
+
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("Category:", GUILayout.Width(80));
+        categoryDropdownIndex = Mathf.Clamp(categoryDropdownIndex, 0, categoryNames.Length - 1);
+        categoryDropdownIndex = GUILayout.SelectionGrid(categoryDropdownIndex, categoryNames, 6, GUILayout.Width(520));
+        selectedCategory = (ItemCategory)categoryDropdownIndex;
+        GUILayout.EndHorizontal();
+
+        GUILayout.Space(6);
+
+        GUILayout.BeginHorizontal();
+        GUILayout.Label("Search:", GUILayout.Width(60));
+        itemSearch = GUILayout.TextField(itemSearch, GUILayout.Width(300));
+        GUILayout.EndHorizontal();
+
+        GUILayout.Space(6);
+
+        var filtered = new List<int>();
+        if (!categoryMap.ContainsKey(selectedCategory))
+        {
+            categoryMap[selectedCategory] = new List<int>();
+            for (int i = 0; i < itemNames.Length; i++) categoryMap[selectedCategory].Add(i);
+        }
+
+        foreach (int idx in categoryMap[selectedCategory])
+        {
+            if (string.IsNullOrEmpty(itemSearch) || itemNames[idx].ToLower().Contains(itemSearch.ToLower()))
+                filtered.Add(idx);
+        }
+
+        if (filtered.Count == 0)
+        {
+            GUILayout.Label("No items match search.");
+            return;
+        }
+
+        int columns = 3;
+        int rows = Mathf.CeilToInt(filtered.Count / (float)columns);
+
+        for (int r = 0; r < rows; r++)
+        {
+            GUILayout.BeginHorizontal();
+            for (int c = 0; c < columns; c++)
+            {
+                int index = r * columns + c;
+                if (index >= filtered.Count) break;
+
+                int realIndex = filtered[index];
+
+                if (GUILayout.Button(itemNames[realIndex], GUILayout.Width(160)))
+                {
+                    selectedItemIndex = realIndex;
+                }
+            }
+            GUILayout.EndHorizontal();
+        }
+
+        GUILayout.Space(10);
+
+        int si = Mathf.Clamp(selectedItemIndex, 0, itemNames.Length - 1);
+        GUILayout.BeginHorizontal();
+        GUILayout.Label($"Selected: {itemNames[si]} (ID: {itemIds[si]})", GUILayout.Width(340));
+        spawnAmount = IntField(spawnAmount, 80);
+        if (GUILayout.Button("Spawn", GUILayout.Width(80)))
+            SpawnItemById(itemIds[si], spawnAmount);
+        GUILayout.EndHorizontal();
+    }
+
+    // TELEPORT TAB
+    void DrawTeleportTab()
 	{
-		GUILayout.Label("Player Options", GUI.skin.box);
-
-		godMode = GUILayout.Toggle(godMode, "God Mode");
-		infiniteStamina = GUILayout.Toggle(infiniteStamina, "Infinite Stamina");
-
-		GUILayout.Space(10);
-		GUILayout.Label("Money", GUI.skin.box);
-
-		GUILayout.BeginHorizontal();
-		GUILayout.Label("Amount:", GUILayout.Width(100));
-		string amtStr = GUILayout.TextField(addMoneyAmount.ToString(), GUILayout.Width(120));
-		if (int.TryParse(amtStr, out int tmpAmt)) addMoneyAmount = tmpAmt;
-		GUILayout.EndHorizontal();
-
-		if (GUILayout.Button("Add Money"))
-			AddMoney(addMoneyAmount);
-
-		GUILayout.Space(10);
-		GUILayout.Label("Time Control", GUI.skin.box);
-
-		freezeTime = GUILayout.Toggle(freezeTime, "Freeze Time");
-		if (freezeTime) ApplyFreezeTime(true);
-		else ApplyFreezeTime(false);
-
-		GUILayout.Space(10);
-		GUILayout.Label("Utilities", GUI.skin.box);
-
-		if (GUILayout.Button("Unlock All Licenses"))
-			UnlockLicenses();
-
-		if (GUILayout.Button("Give All Tools"))
-			GiveAllTools();
-	}
-
-	// ============================ ITEMS TAB ============================
-	void DrawItemsTab()
-	{
-		GUILayout.Label("Item Spawner", GUI.skin.box);
-
-		GUILayout.BeginHorizontal();
-		GUILayout.Label("Search:", GUILayout.Width(80));
-		itemSearch = GUILayout.TextField(itemSearch, GUILayout.Width(180));
-		GUILayout.EndHorizontal();
-
-		GUILayout.Space(5);
-
-		GUILayout.Label("Category:", GUILayout.Width(100));
-		categoryDropdownIndex = GUILayout.SelectionGrid(categoryDropdownIndex, categoryNames, categoryNames.Length);
-		selectedCategory = (ItemCategory)categoryDropdownIndex;
-
-		if (!itemsLoaded) LoadItems();
-
-		GUILayout.Space(10);
-
-		GUILayout.Label("Item List", GUI.skin.box);
-
-		List<int> ids = GetFilteredItemIds(itemSearch, selectedCategory);
-		string[] names = ids.Select(id => itemNames[Array.IndexOf(itemIds, id)]).ToArray();
-
-		selectedItemIndex = GUILayout.SelectionGrid(selectedItemIndex, names, 2);
-
-		GUILayout.Space(10);
-
-		GUILayout.BeginHorizontal();
-		GUILayout.Label("Amount:", GUILayout.Width(80));
-		string amtStr = GUILayout.TextField(spawnAmount.ToString(), GUILayout.Width(80));
-		if (int.TryParse(amtStr, out int amtParsed)) spawnAmount = amtParsed;
-		GUILayout.EndHorizontal();
-
-		if (GUILayout.Button("Spawn Item"))
-		{
-			if (ids.Count > 0 && selectedItemIndex < ids.Count)
-			{
-				int itemId = ids[selectedItemIndex];
-				SpawnItem(itemId, spawnAmount);
-			}
-		}
-	}
-
-	// ============================ TELEPORT TAB ============================
-	void DrawTeleportTab()
-	{
-		GUILayout.Label("Teleport", GUI.skin.box);
+		GUILayout.Label("Teleport System", GUI.skin.box);
 
 		if (GUILayout.Button("Save Current Position"))
 			SavePosition();
@@ -312,464 +307,806 @@ public class DinkumCheatMenu : BaseUnityPlugin
 			TeleportTo(savedPos);
 
 		GUILayout.Space(10);
-		GUILayout.Label("Marker Auto-Teleport", GUI.skin.box);
 
-		autoTeleportOnPlace = GUILayout.Toggle(autoTeleportOnPlace, "Auto-Teleport On Marker Place");
-		autoTeleportOnlyLocal = GUILayout.Toggle(autoTeleportOnlyLocal, "Only teleport to newest marker");
+		GUILayout.Label("Map Marker Teleport", GUI.skin.box);
 
-		GUILayout.Space(10);
-		GUILayout.Label("Marker Hotkey", GUI.skin.box);
-		GUILayout.Label($"Current Hotkey: {hotkeyTeleport}");
-
-		if (GUILayout.Button("Set Hotkey to F6"))
-			hotkeyTeleport = KeyCode.F6;
-		if (GUILayout.Button("Set Hotkey to T"))
-			hotkeyTeleport = KeyCode.T;
-
-		GUILayout.Space(10);
-		GUILayout.Label("Marker Filters", GUI.skin.box);
-
-		string[] filterNames = Enum.GetNames(typeof(MarkerFilter));
-		currentFilter = (MarkerFilter)GUILayout.SelectionGrid((int)currentFilter, filterNames, filterNames.Length);
-
-		GUILayout.Space(15);
-		GUILayout.Label("Markers", GUI.skin.box);
-
-		markerScroll = GUILayout.BeginScrollView(markerScroll, GUILayout.Height(300));
-
-		for (int i = 0; i < markerList.Count; i++)
-		{
-			var mk = markerList[i];
-			if (mk == null) continue;
-
-			if (!MatchFilter(mk, currentFilter)) continue;
-
-			string label = $"{i}. {mk.name}  ({mk.CurrentIconType})";
-
-			GUILayout.BeginHorizontal();
-			if (GUILayout.Button(label, GUILayout.Width(380)))
-				selectedMarkerIndex = i;
-
-			if (GUILayout.Button("TP", GUILayout.Width(50)))
-				TeleportToMarker(mk);
-
-			GUILayout.EndHorizontal();
-		}
-
-		GUILayout.EndScrollView();
-
-		GUILayout.Space(10);
-
-		if (GUILayout.Button("Teleport to Selected Marker"))
-		{
-			if (selectedMarkerIndex >= 0 && selectedMarkerIndex < markerList.Count)
-				TeleportToMarker(markerList[selectedMarkerIndex]);
-		}
-
-		if (GUILayout.Button("Teleport to Last Player Marker"))
+		if (GUILayout.Button("Teleport to Last Marker"))
 			TeleportToLastPlayerMarker();
+		
+		if (GUILayout.Button("Teleport to House"))
+			TeleportToPlayerHouse();
 	}
 
-	// ======================== end PART 2/4 ========================
-	// Plugin_Final.cs — PART 3/4
-	// (Lanjutan dari PART 2/4)
+    // ---------------- Item / inventory helpers ----------------
+    void LoadItems()
+    {
+        TryBindTypes();
 
+        if (inventoryInstance == null || allItemsField == null)
+        {
+            Log.LogWarning("Inventory.Instance or allItemsField not found.");
+            itemsLoaded = false;
+            return;
+        }
 
-	// ====================== MARKER SCANNING SYSTEM ======================
-	void RefreshMarkers(bool clearFirst)
+        try
+        {
+            var arr = allItemsField.GetValue(inventoryInstance) as Array;
+            if (arr == null)
+            {
+                itemsLoaded = false;
+                return;
+            }
+
+            var names = new List<string>();
+            var ids = new List<int>();
+
+            for (int i = 0; i < arr.Length; i++)
+            {
+                var it = arr.GetValue(i);
+                if (it == null) continue;
+
+                string name = ReadStringFieldOrProperty(it, "itemName") ?? ReadStringFieldOrProperty(it, "name") ?? ("Item_" + i);
+                names.Add(name);
+                ids.Add(i);
+            }
+
+            itemNames = names.ToArray();
+            itemIds = ids.ToArray();
+            itemsLoaded = true;
+
+            BuildItemCategories(arr);
+
+            Log.LogInfo($"Loaded {itemNames.Length} items.");
+        }
+        catch (Exception ex)
+        {
+            Log.LogError("LoadItems failed: " + ex.Message);
+            itemsLoaded = false;
+        }
+    }
+
+    void BuildItemCategories(Array arr)
+    {
+        categoryMap.Clear();
+        foreach (ItemCategory cat in Enum.GetValues(typeof(ItemCategory)))
+            categoryMap[cat] = new List<int>();
+
+        for (int i = 0; i < arr.Length; i++)
+        {
+            var it = arr.GetValue(i);
+            if (it == null) continue;
+
+            string name = (i < itemNames.Length ? itemNames[i].ToLower() : ("item_" + i));
+
+            bool isTool = ReadBoolField(it, "isATool");
+            bool isPower = ReadBoolField(it, "isPowerTool");
+            int staminaType = ReadIntField(it, "staminaTypeUse"); // 1 -> weapon
+
+            if (name.Contains("meat") || name.Contains("cook") || name.Contains("fruit") || name.Contains("berry") || name.Contains("food"))
+            {
+                categoryMap[ItemCategory.Food].Add(i);
+                continue;
+            }
+
+            if (staminaType == 1)
+            {
+                categoryMap[ItemCategory.Weapon].Add(i);
+                continue;
+            }
+
+            if (isTool || isPower)
+            {
+                categoryMap[ItemCategory.Tool].Add(i);
+                continue;
+            }
+
+            if (name.Contains("ore") || name.Contains("bar") || name.Contains("plank") || name.Contains("wood") || name.Contains("log") || name.Contains("rock") || name.Contains("stone"))
+            {
+                categoryMap[ItemCategory.Material].Add(i);
+                continue;
+            }
+
+            categoryMap[ItemCategory.Misc].Add(i);
+        }
+
+        // All category
+        categoryMap[ItemCategory.All] = new List<int>();
+        for (int i = 0; i < itemNames.Length; i++)
+            categoryMap[ItemCategory.All].Add(i);
+    }
+
+    bool ReadBoolField(object obj, string fieldName)
+    {
+        if (obj == null) return false;
+        var f = obj.GetType().GetField(fieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (f == null) return false;
+        try { return Convert.ToBoolean(f.GetValue(obj)); } catch { return false; }
+    }
+
+    int ReadIntField(object obj, string fieldName)
+    {
+        if (obj == null) return -1;
+        var f = obj.GetType().GetField(fieldName, BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        if (f == null) return -1;
+        try { return Convert.ToInt32(f.GetValue(obj)); } catch { return -1; }
+    }
+
+    void SpawnItemById(int itemId, int amount)
+    {
+        TryBindTypes();
+        if (inventoryInstance == null || invSlotsField == null)
+        {
+            Log.LogWarning("Inventory missing — cannot spawn item.");
+            return;
+        }
+
+        try
+        {
+            var slots = invSlotsField.GetValue(inventoryInstance) as Array;
+            if (slots == null) return;
+
+            var allItems = allItemsField.GetValue(inventoryInstance) as Array;
+            if (allItems == null) { Log.LogWarning("allItems array is null."); return; }
+
+            if (itemId < 0 || itemId >= allItems.Length) { Log.LogWarning($"Invalid itemId {itemId}"); return; }
+            var template = allItems.GetValue(itemId);
+            if (template == null) { Log.LogWarning($"Template item {itemId} is null."); return; }
+
+            var s0 = slots.GetValue(0);
+            if (s0 == null) { Log.LogWarning("Slot 0 is null."); return; }
+
+            var id0Field = s0.GetType().GetField("itemNo") ?? s0.GetType().GetField("itemID");
+            var st0Field = s0.GetType().GetField("stack") ?? s0.GetType().GetField("amount");
+
+            id0Field?.SetValue(s0, itemId);
+            st0Field?.SetValue(s0, Math.Min(amount, 999));
+
+            bool updated = false;
+            var methodsToTry = new string[] { "updateSlotContentsAndRefresh", "RefreshSlot", "Refresh", "UpdateSlot", "update", "SetSlot" };
+            foreach (var name in methodsToTry)
+            {
+                if (updated) break;
+                try
+                {
+                    var m = s0.GetType().GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                    if (m == null) continue;
+                    var parms = m.GetParameters();
+                    if (parms.Length == 2)
+                    {
+                        m.Invoke(s0, new object[] { itemId, Math.Min(amount, 999) });
+                        updated = true;
+                        break;
+                    }
+                    else if (parms.Length == 0)
+                    {
+                        m.Invoke(s0, null);
+                        updated = true;
+                        break;
+                    }
+                    else if (parms.Length == 1)
+                    {
+                        try { m.Invoke(s0, new object[] { Math.Min(amount, 999) }); updated = true; break; } catch { }
+                        try { m.Invoke(s0, new object[] { itemId }); updated = true; break; } catch { }
+                    }
+                }
+                catch { }
+            }
+
+            if (!updated)
+            {
+                try
+                {
+                    var invType = inventoryInstance.GetType();
+                    var refreshMethod = invType.GetMethod("RefreshInvSlots") ?? invType.GetMethod("RefreshInventory") ?? invType.GetMethod("refresh");
+                    if (refreshMethod != null) { refreshMethod.Invoke(inventoryInstance, null); updated = true; }
+                }
+                catch { }
+            }
+
+            if (!updated)
+            {
+                Log.LogWarning("SpawnItemById: couldn't invoke slot update method, but fields were set (slot may not refresh visually).");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.LogError("SpawnItemById failed: " + ex.Message);
+        }
+    }
+
+    // ---------------- Money / Time / Teleport / Licences / Give Tools ----------------
+    void AddMoney(int amount)
+    {
+        TryBindTypes();
+
+        if (inventoryInstance == null)
+        {
+            Log.LogWarning("Inventory.Instance not found.");
+            return;
+        }
+
+        try
+        {
+            // Prefer walletField cached from TryBindTypes
+            walletField ??= inventoryInstance.GetType().GetField("wallet", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+            if (walletField != null)
+            {
+                var curObj = walletField.GetValue(inventoryInstance);
+                if (curObj is int curInt)
+                {
+                    walletField.SetValue(inventoryInstance, curInt + amount);
+                }
+                else
+                {
+                    // sometimes wallet is a struct/class - try convert
+                    try
+                    {
+                        int cur = Convert.ToInt32(curObj);
+                        walletField.SetValue(inventoryInstance, cur + amount);
+                    }
+                    catch { }
+                }
+            }
+
+            // also try walletSlot if present
+            var walletSlotField = inventoryInstance.GetType().GetField("walletSlot", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+            if (walletSlotField != null)
+            {
+                var walletSlot = walletSlotField.GetValue(inventoryInstance);
+                if (walletSlot != null)
+                {
+                    var stackField = walletSlot.GetType().GetField("stack", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic)
+                                 ?? walletSlot.GetType().GetField("amount", BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+                    if (stackField != null)
+                    {
+                        var prevObj = stackField.GetValue(walletSlot);
+                        try
+                        {
+                            int prev = Convert.ToInt32(prevObj);
+                            stackField.SetValue(walletSlot, prev + amount);
+                        }
+                        catch { }
+                    }
+                }
+            }
+
+            Log.LogInfo($"Added {amount} money successfully.");
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning("AddMoney failed: " + ex.Message);
+        }
+    }
+
+    void ToggleFreezeTime()
+    {
+        try
+        {
+            var rwtlType = FindTypeByName("RealWorldTimeLight");
+            if (rwtlType == null)
+            {
+                Log.LogWarning("FreezeTime: RealWorldTimeLight not found.");
+                return;
+            }
+
+            var rwtl = UnityEngine.Object.FindObjectOfType(rwtlType) as Component;
+            if (rwtl == null)
+            {
+                Log.LogWarning("FreezeTime: instance not found.");
+                return;
+            }
+
+            var speedField = rwtlType.GetField("currentSpeed", BindingFlags.Instance | BindingFlags.NonPublic | BindingFlags.Public);
+            var changeMethod = rwtlType.GetMethod("OnChangeTimeSpeed", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+
+            if (speedField == null || changeMethod == null)
+            {
+                Log.LogWarning("FreezeTime internal fields not found.");
+                return;
+            }
+
+            float current = (float)speedField.GetValue(rwtl);
+
+            if (!freezeTime)
+            {
+                savedDaySpeed = current;
+                freezeTime = true;
+                changeMethod.Invoke(rwtl, new object[] { current, 36000f });
+                Log.LogInfo("Time frozen.");
+            }
+            else
+            {
+                freezeTime = false;
+                changeMethod.Invoke(rwtl, new object[] { 36000f, savedDaySpeed });
+                Log.LogInfo($"Time unfrozen (restored to {savedDaySpeed}).");
+            }
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning("ToggleFreezeTime failed: " + ex.Message);
+        }
+    }
+
+    void UnlockAllLicences()
+    {
+        TryBindTypes();
+
+        var lmInst = FindTypeInstanceByName("LicenceManager") ??
+                     FindTypeInstanceByName("LicenseManager");
+
+        if (lmInst == null)
+        {
+            Log.LogWarning("LicenceManager instance not found.");
+            return;
+        }
+
+        var lmType = lmInst.GetType();
+        var allField =
+            lmType.GetField("allLicences", BindingFlags.Public | BindingFlags.Instance) ??
+            lmType.GetField("allLicences", BindingFlags.NonPublic | BindingFlags.Instance);
+
+        if (allField == null)
+        {
+            Log.LogWarning("LicenceManager.allLicences not found.");
+            return;
+        }
+
+        var arr = allField.GetValue(lmInst) as Array;
+        if (arr == null)
+        {
+            Log.LogWarning("allLicences is null.");
+            return;
+        }
+
+        for (int i = 0; i < arr.Length; i++)
+        {
+            var lic = arr.GetValue(i);
+            if (lic == null) continue;
+
+            var unlocked =
+                lic.GetType().GetField("isUnlocked", BindingFlags.Public | BindingFlags.Instance) ??
+                lic.GetType().GetField("isUnlocked", BindingFlags.NonPublic | BindingFlags.Instance);
+
+            unlocked?.SetValue(lic, true);
+
+            var curLevel =
+                lic.GetType().GetField("currentLevel", BindingFlags.Public | BindingFlags.Instance) ??
+                lic.GetType().GetField("currentLevel", BindingFlags.NonPublic | BindingFlags.Instance);
+
+            var maxLevel =
+                lic.GetType().GetField("maxLevel", BindingFlags.Public | BindingFlags.Instance) ??
+                lic.GetType().GetField("maxLevel", BindingFlags.NonPublic | BindingFlags.Instance);
+
+            if (curLevel != null && maxLevel != null)
+            {
+                curLevel.SetValue(lic, maxLevel.GetValue(lic));
+                continue;
+            }
+
+            var getCurrent = lic.GetType().GetMethod("getCurrentLevel");
+            var getMax = lic.GetType().GetMethod("getMaxLevel");
+            var buyNext = lic.GetType().GetMethod("buyNextLevel") ??
+                          lic.GetType().GetMethod("BuyNextLevel");
+
+            if (getCurrent != null && getMax != null && buyNext != null)
+            {
+                try
+                {
+                    while ((int)getCurrent.Invoke(lic, null) < (int)getMax.Invoke(lic, null))
+                        buyNext.Invoke(lic, null);
+                }
+                catch { }
+            }
+        }
+
+        Log.LogInfo("UnlockAllLicences completed.");
+    }
+	void SavePosition()
+    {
+        try
+        {
+            GameObject playerGO = GameObject.FindWithTag("Player") ?? GameObject.Find("Player");
+            if (playerGO != null)
+            {
+                savedPos = playerGO.transform.position;
+                Log.LogInfo($"Saved position = {savedPos}");
+                return;
+            }
+
+            var nms = FindTypeInstanceByName("NetworkMapSharer");
+            if (nms != null)
+            {
+                var member = nms.GetType().GetProperty("localChar") as MemberInfo
+                          ?? nms.GetType().GetField("localChar") as MemberInfo;
+
+                if (member != null)
+                {
+                    object localChar = null;
+                    if (member is PropertyInfo pi) localChar = pi.GetValue(nms, null);
+                    else if (member is FieldInfo fi) localChar = fi.GetValue(nms);
+
+                    if (localChar != null)
+                    {
+                        var tr = localChar.GetType().GetProperty("transform")?.GetValue(localChar, null);
+                        if (tr != null)
+                        {
+                            savedPos = (Vector3)tr.GetType().GetProperty("position").GetValue(tr, null);
+                            Log.LogInfo($"Saved multiplayer pos = {savedPos}");
+                            return;
+                        }
+                    }
+                }
+            }
+
+            Log.LogWarning("SavePosition: Player not found.");
+        }
+        catch (Exception ex)
+        {
+            Log.LogWarning("SavePosition failed: " + ex.Message);
+        }
+    }
+
+	// Teleport - 
+	float GetGroundY(Vector3 pos)
 	{
-		try
-		{
-			if (clearFirst)
-				markerList.Clear();
+		// Mulai raycast dari atas
+		Vector3 start = new Vector3(pos.x, pos.y + 200f, pos.z);
 
-			var icons = GameObject.FindObjectsOfType<mapIcon>();
-			markerList = icons.ToList();
-		}
-		catch (Exception ex)
-		{
-			Log.LogError($"RefreshMarkers failed: {ex.Message}");
-		}
+		if (Physics.Raycast(start, Vector3.down, out RaycastHit hit, 500f))
+			return hit.point.y;
+
+		// fallback bila terrain tidak terdeteksi
+		return pos.y + 0.5f;
 	}
 
-
-	// ====================== MARKER FILTER MATCH ======================
-	bool MatchFilter(mapIcon mk, MarkerFilter f)
+	System.Collections.IEnumerator SafeTeleportRoutine(Vector3 targetPos)
 	{
-		switch (f)
+		// ---------------------------
+		// 1. Cari player (versi lama yang sudah terbukti)
+		// ---------------------------
+		GameObject playerGO = GameObject.FindWithTag("Player") ?? GameObject.Find("Player");
+
+		// Multiplayer fallback
+		if (playerGO == null)
 		{
-			case MarkerFilter.All:
-				return true;
-
-			case MarkerFilter.PlayerPlaced:
-				return mk.CurrentIconType == mapIcon.iconType.PlayerPlaced;
-
-			case MarkerFilter.Quest:
-				return mk.CurrentIconType == mapIcon.iconType.Quest ||
-					   mk.CurrentIconType == mapIcon.iconType.Task;
-
-			case MarkerFilter.NPC:
-				return mk.CurrentIconType == mapIcon.iconType.NPC;
-
-			case MarkerFilter.TeleTower:
-				return mk.CurrentIconType == mapIcon.iconType.TeleTower ||
-					   mk.name.ToLower().Contains("tower");
-
-			case MarkerFilter.TileObject:
-				return mk.CurrentIconType == mapIcon.iconType.TileObject;
-
-			case MarkerFilter.Special:
-				return mk.CurrentIconType == mapIcon.iconType.Special ||
-					   mk.name.ToLower().Contains("mine") ||
-					   mk.name.ToLower().Contains("dungeon");
-
-			default:
-				return true;
-		}
-	}
-
-
-	// ====================== TELEPORT LOGIC ======================
-	void TeleportTo(Vector3 pos)
-	{
-		try
-		{
-			GameObject player = GameObject.FindWithTag("Player");
-			if (player == null)
+			var nms = FindTypeInstanceByName("NetworkMapSharer");
+			if (nms != null)
 			{
-				Log.LogWarning("Teleport failed: Player not found.");
-				return;
-			}
+				var member = nms.GetType().GetProperty("localChar") as MemberInfo
+						  ?? nms.GetType().GetField("localChar") as MemberInfo;
 
-			pos.y += teleportYOffset;
+				object localChar = null;
 
-			CharacterController cc = player.GetComponent<CharacterController>();
-			if (cc != null)
-			{
-				cc.enabled = false;
-				player.transform.position = pos;
-				cc.enabled = true;
-			}
-			else player.transform.position = pos;
-
-			Log.LogInfo($"Teleported to {pos}");
-		}
-		catch (Exception ex)
-		{
-			Log.LogError("TeleportTo failed: " + ex.Message);
-		}
-	}
-
-
-	// ====================== TELEPORT TO MARKER ======================
-	void TeleportToMarker(mapIcon mk)
-	{
-		if (mk == null) return;
-
-		Vector3 pos;
-
-		try
-		{
-			// the REAL world position defined by mapIcon.cs
-			pos = mk.PointingAtPosition;
-		}
-		catch
-		{
-			// fallback: use object transform (may be inaccurate)
-			pos = mk.transform.position;
-		}
-
-		pos.y += teleportYOffset;
-
-		TeleportTo(pos);
-	}
-
-
-	// ====================== LAST PLAYER MARKER ======================
-	void TeleportToLastPlayerMarker()
-	{
-		mapIcon last = null;
-
-		foreach (var mk in markerList)
-		{
-			if (mk == null) continue;
-			if (mk.CurrentIconType == mapIcon.iconType.PlayerPlaced)
-				last = mk;
-		}
-
-		if (last == null)
-		{
-			Log.LogWarning("No player-placed markers found.");
-			return;
-		}
-
-		TeleportToMarker(last);
-	}
-
-
-	// ====================== AUTO TELEPORT WHEN PLAYER PLACES MARKER ======================
-	void CheckAutoTeleportNewMarker()
-	{
-		try
-		{
-			var icons = GameObject.FindObjectsOfType<mapIcon>();
-
-			foreach (var mk in icons)
-			{
-				if (mk == null) continue;
-				int id = mk.GetInstanceID();
-
-				// first time seen?
-				if (!knownMarkerInstanceIds.Contains(id))
+				if (member != null)
 				{
-					knownMarkerInstanceIds.Add(id);
+					if (member is PropertyInfo pi) localChar = pi.GetValue(nms, null);
+					else if (member is FieldInfo fi) localChar = fi.GetValue(nms);
 
-					if (mk.CurrentIconType == mapIcon.iconType.PlayerPlaced)
+					if (localChar != null)
 					{
-						Log.LogInfo("Auto-teleport triggered: new player marker detected.");
-						TeleportToMarker(mk);
+						var goMember = localChar.GetType().GetProperty("gameObject") as MemberInfo
+								   ?? localChar.GetType().GetField("gameObject") as MemberInfo;
+
+						if (goMember != null)
+						{
+							if (goMember is PropertyInfo gpi) playerGO = (GameObject)gpi.GetValue(localChar, null);
+							else if (goMember is FieldInfo gfi) playerGO = (GameObject)gfi.GetValue(localChar);
+						}
+						else
+						{
+							var trProp = localChar.GetType().GetProperty("transform");
+							if (trProp != null) playerGO = ((Transform)trProp.GetValue(localChar, null)).gameObject;
+						}
 					}
 				}
 			}
 		}
-		catch (Exception ex)
+
+		if (playerGO == null)
 		{
-			Log.LogError("CheckAutoTeleportNewMarker failed: " + ex.Message);
+			Log.LogWarning("SafeTeleport: Player not found.");
+			yield break;
 		}
+
+		// ---------------------------
+		// 2. Nonaktifkan CharacterController sementara
+		// ---------------------------
+		CharacterController cc = playerGO.GetComponent<CharacterController>();
+		if (cc != null) cc.enabled = false;
+
+		// ---------------------------
+		// 3. Teleport tinggi dulu (+40)
+		// ---------------------------
+		Vector3 highPos = targetPos;
+		highPos.y += 40f;
+		playerGO.transform.position = highPos;
+
+		// ---------------------------
+		// 4. Tunggu terrain load
+		// ---------------------------
+		float groundY = GetGroundY(targetPos);
+		int maxFrames = 300;
+		int frameCount = 0;
+
+		while (groundY < targetPos.y - 1f && frameCount < maxFrames)
+		{
+			groundY = GetGroundY(targetPos);
+			frameCount++;
+			yield return null;
+		}
+
+		// ---------------------------
+		// 5. Teleport final
+		// ---------------------------
+		targetPos.y = groundY + 0.1f;
+		playerGO.transform.position = targetPos;
+
+		// ---------------------------
+		// 6. Aktifkan kembali CC
+		// ---------------------------
+		if (cc != null) cc.enabled = true;
+
+		Log.LogInfo($"SAFE TELEPORT COMPLETE @ {targetPos}");
 	}
 
-
-	// ====================== HOTKEY TELEPORT ======================
-	void TryTeleportHotkey()
+	void TeleportTo(Vector3 pos)
 	{
-		// If any marker selected, teleport to that
-		if (selectedMarkerIndex >= 0 &&
-			selectedMarkerIndex < markerList.Count &&
-			markerList[selectedMarkerIndex] != null)
+		StartCoroutine(SafeTeleportRoutine(pos));
+	}
+
+	void TeleportToSaved() => TeleportTo(savedPos);
+
+	void TeleportToLastPlayerMarker()
+	{
+		mapIcon[] icons = GameObject.FindObjectsOfType<mapIcon>();
+		mapIcon last = null;
+
+		foreach (var icon in icons)
+			if (icon.CurrentIconType == mapIcon.iconType.PlayerPlaced)
+				last = icon;
+
+		if (last == null)
 		{
-			TeleportToMarker(markerList[selectedMarkerIndex]);
+			Log.LogWarning("No player-placed marker found.");
 			return;
 		}
 
-		// else teleport to last marker
-		TeleportToLastPlayerMarker();
+		Vector3 pos = last.PointingAtPosition;
+		pos.y += 1.3f;
+
+		TeleportTo(pos);
+		Log.LogInfo($"Teleported to player marker @ {pos}");
 	}
 
-
-	// ====================== SAVE POSITION ======================
-	void SavePosition()
+	void TeleportToPlayerHouse()
 	{
-		var player = GameObject.FindWithTag("Player");
-		if (player != null)
+		mapIcon[] icons = GameObject.FindObjectsOfType<mapIcon>();
+		mapIcon houseIcon = null;
+
+		foreach (var icon in icons)
 		{
-			savedPos = player.transform.position;
-			Log.LogInfo("Position saved.");
-		}
-	}
-
-
-	// ====================== STAMINA HANDLER ======================
-	void TrySetStaminaToMax()
-	{
-		try
-		{
-			if (statusManagerInstance == null || getStaminaMaxMethod == null) return;
-
-			float maxStamina = (float)getStaminaMaxMethod.Invoke(statusManagerInstance, null);
-			staminaField.SetValue(statusManagerInstance, maxStamina);
-		}
-		catch { }
-	}
-
-
-	// ======================== end PART 3/4 ========================
-	// Plugin_Final.cs — PART 4/4
-	// (Lanjutan dari PART 3/4)
-
-
-	// ====================== MONEY ADDER ======================
-	void AddMoney(int amount)
-	{
-		try
-		{
-			if (Inventory.Instance == null)
+			if (string.IsNullOrEmpty(icon.IconName)) continue;
+			if (icon.IconName.Contains("House"))
 			{
-				Log.LogWarning("Inventory.Instance NULL");
-				return;
-			}
-
-			Inventory.Instance.AddMoney(amount);
-			Log.LogInfo($"Money added: {amount}");
-		}
-		catch (Exception ex)
-		{
-			Log.LogError("AddMoney failed: " + ex.Message);
-		}
-	}
-
-
-	// ====================== FREEZE TIME ======================
-	void ApplyTimeFreeze()
-	{
-		try
-		{
-			if (!freezeTimeEnabled)
-			{
-				Time.timeScale = 1f;
-				return;
-			}
-
-			Time.timeScale = timeFreezeValue;
-		}
-		catch (Exception ex)
-		{
-			Log.LogError("ApplyTimeFreeze failed: " + ex.Message);
-		}
-	}
-
-
-	// ====================== LICENSE HANDLER ======================
-	void UnlockAllLicenses()
-	{
-		try
-		{
-			if (LicenseManager.manage == null)
-			{
-				Log.LogWarning("LicenseManager.manage NULL");
-				return;
-			}
-
-			for (int i = 0; i < LicenseManager.manage.allLicenses.Length; i++)
-			{
-				LicenseManager.manage.allLicenses[i].level = 5;
-			}
-
-			Log.LogInfo("All licenses unlocked.");
-		}
-		catch (Exception ex)
-		{
-			Log.LogError("UnlockAllLicenses failed: " + ex.Message);
-		}
-	}
-
-
-	// ====================== GIVE TOOLS ======================
-	void GiveAllTools()
-	{
-		try
-		{
-			var inv = Inventory.Instance;
-
-			if (inv == null)
-			{
-				Log.LogWarning("Inventory.Instance NULL");
-				return;
-			}
-
-			foreach (var item in inv.allItems)
-			{
-				if (item == null) continue;
-				if (item.isTool)
-				{
-					inv.addItemToInventory(item, 1);
-				}
-			}
-
-			Log.LogInfo("All tools given.");
-		}
-		catch (Exception ex)
-		{
-			Log.LogError("GiveAllTools failed: " + ex.Message);
-		}
-	}
-
-
-	// ====================== ITEM SPAWNER LISTINGS ======================
-
-	string[] materialItems = new string[] { "Tin Ore", "Copper Ore", "Iron Ore", "Quartz", "Stone", "Palm Wood", "Gum Wood" };
-	string[] foodItems = new string[] { "Cooked Drumstick", "Cooked Fish", "Fruit Salad", "Meat Pie" };
-	string[] miscItems = new string[] { "Honey", "Beeswax", "Clover", "Gears", "Old Key" };
-
-
-	// ====================== ITEM SPAWNER ======================
-	void SpawnItem(string name, int amount)
-	{
-		try
-		{
-			var inv = Inventory.Instance;
-
-			foreach (var item in inv.allItems)
-			{
-				if (item == null) continue;
-				if (item.getInvItemName(1).Equals(name, StringComparison.OrdinalIgnoreCase))
-				{
-					inv.addItemToInventory(item, amount);
-					Log.LogInfo($"Spawned {amount}x {name}");
-					return;
-				}
-			}
-
-			Log.LogWarning($"Item not found: {name}");
-		}
-		catch (Exception ex)
-		{
-			Log.LogError("SpawnItem failed: " + ex.Message);
-		}
-	}
-
-
-	// ====================== REFLECTION LOADERS ======================
-	void LoadReflection()
-	{
-		try
-		{
-			var player = GameObject.FindWithTag("Player");
-			if (player != null)
-			{
-				statusManagerInstance = player.GetComponent("StatusManager");
-				var type = statusManagerInstance.GetType();
-
-				staminaField = type.GetField("currentStamina", BindingFlags.Public | BindingFlags.Instance);
-				getStaminaMaxMethod = type.GetMethod("GetMaxStamina", BindingFlags.Public | BindingFlags.Instance);
-
-				Log.LogInfo("Reflection loaded.");
+				houseIcon = icon;
+				break;
 			}
 		}
-		catch (Exception ex)
+
+		if (houseIcon == null)
 		{
-			Log.LogError($"LoadReflection failed: {ex.Message}");
+			Log.LogWarning("Player house icon not found.");
+			return;
 		}
+
+		Vector3 pos = houseIcon.PointingAtPosition;
+		pos.y += 1.3f;
+
+		TeleportTo(pos);
+		Log.LogInfo($"Teleported to House @ {pos}");
 	}
 
+    void GiveAllTools()
+    {
+        TryBindTypes();
 
-	// ====================== HELPERS ======================
-	Vector3? GetMarkerPosition(mapIcon mk)
-	{
-		if (mk == null) return null;
+        if (inventoryInstance == null || invSlotsField == null)
+            return;
 
-		try
-		{
-			return mk.PointingAtPosition;
-		}
-		catch
-		{
-			return mk.transform.position;
-		}
-	}
+        var slots = invSlotsField.GetValue(inventoryInstance) as Array;
+        if (slots == null) return;
 
+        int[] toolIds = { 1, 2, 3, 4, 5, 6, 7 };
 
-	// ====================== GIZMOS / DEBUG DRAW (optional) ======================
-	void DrawDebugMarker(mapIcon mk)
-	{
-		try
-		{
-			Vector3? pos = GetMarkerPosition(mk);
-			if (pos == null) return;
+        for (int i = 0; i < Math.Min(slots.Length, toolIds.Length); i++)
+        {
+            int id = toolIds[i];
+            var slot = slots.GetValue(i);
+            if (slot == null) continue;
 
-			Debug.DrawLine((Vector3)pos + Vector3.up * 2f, (Vector3)pos + Vector3.up * 10f, Color.magenta);
-		}
-		catch { }
-	}
+            var idField = slot.GetType().GetField("itemNo") ??
+                          slot.GetType().GetField("itemID");
 
-	// ====================== END OF FILE ======================
+            var stackField = slot.GetType().GetField("stack") ??
+                             slot.GetType().GetField("amount");
+
+            try
+            {
+                idField?.SetValue(slot, id);
+                stackField?.SetValue(slot, 1);
+            }
+            catch { }
+
+            SafeRefreshSlot(slot, id, 1);
+        }
+
+        Log.LogInfo("Tools granted.");
+    }
+
+    void SafeRefreshSlot(object slot, int itemId, int amount)
+    {
+        if (slot == null) return;
+
+        string[] methodNames =
+        {
+            "updateSlotContentsAndRefresh",
+            "UpdateSlotContentsAndRefresh",
+            "RefreshSlotContents",
+            "RefreshSlot",
+            "UpdateSlot",
+            "update",
+            "refresh",
+            "SetSlot",
+            "SetContent",
+            "Refresh",
+        };
+
+        foreach (var name in methodNames)
+        {
+            try
+            {
+                var m = slot.GetType().GetMethod(name, BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+                if (m == null) continue;
+
+                var p = m.GetParameters();
+
+                if (p.Length == 2)
+                {
+                    m.Invoke(slot, new object[] { itemId, amount });
+                    return;
+                }
+
+                if (p.Length == 1)
+                {
+                    try { m.Invoke(slot, new object[] { itemId }); return; }
+                    catch { }
+                    try { m.Invoke(slot, new object[] { amount }); return; }
+                    catch { }
+                }
+
+                if (p.Length == 0)
+                {
+                    m.Invoke(slot, null);
+                    return;
+                }
+            }
+            catch { }
+        }
+
+        try
+        {
+            if (inventoryInstance != null)
+            {
+                var invType = inventoryInstance.GetType();
+                var refreshInv =
+                    invType.GetMethod("RefreshInvSlots") ??
+                    invType.GetMethod("RefreshInventory") ??
+                    invType.GetMethod("Refresh") ??
+                    invType.GetMethod("refresh");
+
+                refreshInv?.Invoke(inventoryInstance, null);
+            }
+        }
+        catch { }
+    }
+
+    // ---------------- Reflection / binder helpers ----------------
+    void TryBindTypes()
+    {
+        if (inventoryType == null) inventoryType = FindTypeByName("Inventory");
+        if (inventoryType != null && inventoryInstance == null)
+        {
+            // Try multiple common static fields / properties
+            var f = inventoryType.GetField("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                    ?? inventoryType.GetField("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                    ?? inventoryType.GetField("Manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                    ?? inventoryType.GetField("manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            inventoryInstance = f?.GetValue(null);
+
+            if (inventoryInstance == null)
+            {
+                var p = inventoryType.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?? inventoryType.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?? inventoryType.GetProperty("Manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                        ?? inventoryType.GetProperty("manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+                inventoryInstance = p?.GetValue(null, null);
+            }
+
+            invSlotsField = inventoryType.GetField("invSlots", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            allItemsField = inventoryType.GetField("allItems", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+            walletField = inventoryType.GetField("wallet", BindingFlags.Public | BindingFlags.NonPublic | BindingFlags.Instance);
+        }
+
+        if (statusManagerType == null) statusManagerType = FindTypeByName("StatusManager");
+        if (statusManagerType != null && statusManagerInstance == null)
+        {
+            var f = statusManagerType.GetField("manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic)
+                    ?? statusManagerType.GetField("Manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+            statusManagerInstance = f?.GetValue(null);
+            healthField = statusManagerType.GetField("health", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            maxHealthField = statusManagerType.GetField("maxHealth", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            staminaField = statusManagerType.GetField("stamina", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+            getStaminaMaxMethod = statusManagerType.GetMethod("getStaminaMax", BindingFlags.Instance | BindingFlags.Public | BindingFlags.NonPublic);
+        }
+    }
+
+    Type FindTypeByName(string name)
+    {
+        foreach (var asm in AppDomain.CurrentDomain.GetAssemblies())
+        {
+            try
+            {
+                var types = asm.GetTypes();
+                foreach (var t in types) if (t.Name == name) return t;
+            }
+            catch { }
+        }
+        return null;
+    }
+
+    object FindTypeInstanceByName(string name)
+    {
+        var t = FindTypeByName(name); if (t == null) return null;
+        var f = t.GetField("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic) ??
+                t.GetField("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic) ??
+                t.GetField("manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic) ??
+                t.GetField("Manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        if (f != null) return f.GetValue(null);
+        var p = t.GetProperty("Instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic) ??
+                t.GetProperty("instance", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic) ??
+                t.GetProperty("manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic) ??
+                t.GetProperty("Manage", BindingFlags.Static | BindingFlags.Public | BindingFlags.NonPublic);
+        if (p != null) return p.GetValue(null, null);
+        return null;
+    }
+
+    string ReadStringFieldOrProperty(object obj, string name)
+    {
+        var t = obj.GetType();
+        var f = t.GetField(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+        if (f != null) return f.GetValue(obj)?.ToString();
+        var p = t.GetProperty(name, BindingFlags.Public | BindingFlags.Instance | BindingFlags.NonPublic);
+        if (p != null) return p.GetValue(obj, null)?.ToString();
+        return null;
+    }
+
+    int IntField(int value, int width)
+    {
+        string s = GUILayout.TextField(value.ToString(), GUILayout.Width(width));
+        int r = value; int.TryParse(s, out r); return r;
+    }
+
+    void TrySetStaminaToMax()
+    {
+        TryBindTypes();
+        if (statusManagerInstance == null) return;
+        if (staminaField == null || getStaminaMaxMethod == null) return;
+        try
+        {
+            float max = (float)getStaminaMaxMethod.Invoke(statusManagerInstance, null);
+            staminaField.SetValue(statusManagerInstance, max);
+        }
+        catch { }
+    }
 }
